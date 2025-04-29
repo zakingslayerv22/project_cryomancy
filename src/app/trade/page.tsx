@@ -1,5 +1,6 @@
 "use client";
 
+import { config } from "@/config";
 import "@solana/wallet-adapter-react-ui/styles.css";
 import React, { useState, useEffect, useRef } from "react";
 import {
@@ -21,6 +22,8 @@ import {
   IconButton,
   Avatar,
   Popover,
+  ToggleButton,
+  ToggleButtonGroup,
 } from "@mui/material";
 import SellIcon from "@mui/icons-material/Sell";
 import PowerSettingsNewIcon from "@mui/icons-material/PowerSettingsNew";
@@ -28,22 +31,55 @@ import PowerSettingsNewIcon from "@mui/icons-material/PowerSettingsNew";
 import { WalletMultiButton } from "@solana/wallet-adapter-react-ui";
 import { useWallet } from "@solana/wallet-adapter-react";
 import { useRouter } from "next/navigation";
+import { Connection, LAMPORTS_PER_SOL, PublicKey } from "@solana/web3.js";
+
+// ===== New Imports for Borsh decoding =====
+import { struct, u8, u64, publicKey } from "@project-serum/borsh";
+import { AccountLayout } from "@solana/spl-token";
+
+// ===== Define Raydium Pool Layout (V4) =====
+// This layout describes the binary structure of a Raydium liquidity pool account.
+// Extend with additional fields as required.
+const RaydiumPoolLayout = struct([
+  u8("status"),
+  u8("nonce"),
+  publicKey("baseMint"),
+  publicKey("quoteMint"),
+  publicKey("lpMint"),
+  publicKey("baseVault"),
+  publicKey("quoteVault"),
+  publicKey("marketId"),
+  u64("baseDecimals"),
+  u64("quoteDecimals"),
+  // ... include other fields as needed
+]);
+
+// QuickNode endpoints for HTTP and WebSocket
+// const QUICKNODE_HTTP_ENDPOINT = process.env.NEXT_PUBLIC_QUICKNODE_HTTP_ENDPOINT;
+// const QUICKNODE_WS_ENDPOINT = process.env.NEXT_PUBLIC_QUICKNODE_WS_ENDPOINT;
+
+// Raydium program public key
+const RAYDIUM_PROGRAM_ID = new PublicKey(
+  "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"
+);
+
+// Use a regex to match multiple candidate pool creation instruction names.
+const POOL_CREATION_REGEX = /(?:init_pool|initialize2|create_pool)/i;
 
 export default function TradeDashboard() {
   // Mounting state
   const [mounted, setMounted] = useState(false);
 
-  // Trade parameters (all numeric fields are compulsory)
+  // Trade parameters
   const [amountToBuy, setAmountToBuy] = useState("");
   const [maxTrades, setMaxTrades] = useState("");
   const [buyingMarketCap, setBuyingMarketCap] = useState("");
   const [sellingMarketCap, setSellingMarketCap] = useState("");
-  const [maxTokenHoldings, setMaxTokenHoldings] = useState("");
   const [stopLoss, setStopLoss] = useState("");
   const [slippage, setSlippage] = useState("");
   const [priorityFee, setPriorityFee] = useState("");
 
-  // Toggle switches (not compulsory)
+  // Toggle switches
   const [checkTwitter, setCheckTwitter] = useState(false);
   const [checkTelegram, setCheckTelegram] = useState(false);
   const [checkWebsite, setCheckWebsite] = useState(false);
@@ -62,7 +98,7 @@ export default function TradeDashboard() {
     percentage: 50,
   });
 
-  // Total Profit and Loss (for display in stats)
+  // Total Profit and Loss
   const [totalProfit, setTotalProfit] = useState("20.2 SOL");
   const [totalLoss, setTotalLoss] = useState("10.0 SOL");
 
@@ -111,28 +147,34 @@ export default function TradeDashboard() {
     },
   ];
 
+  // New pools state for Raydium new liquidity pools
+  const [newPools, setNewPools] = useState([]);
+
   // Server status
   const [serverConnected, setServerConnected] = useState(true);
 
-  // Emergency sell field (not compulsory)
+  // Emergency sell field
   const [emergencyMint, setEmergencyMint] = useState("");
 
-  // Trading state to disable form after start
+  // Trading state
   const [tradingStarted, setTradingStarted] = useState(false);
 
-  // Timer state (starts when trading begins)
+  // Timer state
   const [timerCount, setTimerCount] = useState(0);
 
-  // Wallet balance (simulated)
+  // Wallet balance (real-time updated)
   const [walletBalance, setWalletBalance] = useState("10.00 SOL");
 
-  // Profile menu state (toggled on click)
+  // Measurement mode state: "SOL" or "%"
+  const [measurementMode, setMeasurementMode] = useState("SOL");
+
+  // Profile menu state
   const [profileAnchorEl, setProfileAnchorEl] = useState(null);
 
   // Refs for autoscroll
   const statsRef = useRef(null);
 
-  const { connected, disconnect } = useWallet();
+  const { publicKey, connected, disconnect } = useWallet();
   const router = useRouter();
 
   useEffect(() => {
@@ -152,47 +194,182 @@ export default function TradeDashboard() {
     return () => clearInterval(interval);
   }, [tradingStarted]);
 
-  // Toggle profile popover on click
+  // Real-time wallet balance update using QuickNode HTTP endpoint
+  useEffect(() => {
+    if (connected && publicKey) {
+      const connection = new Connection(QUICKNODE_HTTP_ENDPOINT);
+      connection.getBalance(publicKey).then((lamports) => {
+        setWalletBalance((lamports / LAMPORTS_PER_SOL).toFixed(2) + " SOL");
+      });
+      const subscriptionId = connection.onAccountChange(
+        publicKey,
+        (accountInfo) => {
+          setWalletBalance(
+            (accountInfo.lamports / LAMPORTS_PER_SOL).toFixed(2) + " SOL"
+          );
+        }
+      );
+      return () => connection.removeAccountChangeListener(subscriptionId);
+    }
+  }, [connected, publicKey]);
+
+  // ===== New useEffect: Listen to Raydium logs for pool initialization =====
+  useEffect(() => {
+    const connectionWs = new Connection(config.QUICKNODE_HTTP_ENDPOINT, {
+      wsEndpoint: config.QUICKNODE_WS_ENDPOINT,
+    });
+
+    const logSubId = connectionWs.onLogs(
+      RAYDIUM_PROGRAM_ID,
+      async (logInfo) => {
+        if (logInfo.err) return;
+
+        // Check for pool initialization logs using a few possible instruction names.
+        if (logInfo.logs.some((log) => POOL_CREATION_REGEX.test(log))) {
+          try {
+            // Fetch transaction details with proper checks using optional chaining.
+            const tx = await connectionWs.getTransaction(logInfo.signature, {
+              maxSupportedTransactionVersion: 0,
+              commitment: "confirmed",
+            });
+
+            // Safeguard: Ensure that tx, tx.transaction, and tx.transaction.message.accountKeys exist.
+            const accountKeys = tx?.transaction?.message?.accountKeys;
+            if (!accountKeys) {
+              console.warn(
+                "Account keys undefined for transaction:",
+                logInfo.signature
+              );
+              return;
+            }
+
+            // Extract pool account using find on accountKeys.
+            const poolAccount = accountKeys.find(
+              (key) => key.toString() === RAYDIUM_PROGRAM_ID.toString()
+            );
+
+            if (poolAccount) {
+              const poolInfo = await connectionWs.getAccountInfo(poolAccount);
+              if (poolInfo) {
+                const poolData = RaydiumPoolLayout.decode(poolInfo.data);
+
+                setNewPools((prev) => [
+                  ...prev,
+                  {
+                    lpSignature: logInfo.signature,
+                    lpAddress: poolAccount.toString(),
+                    tokenAddress: poolData.baseMint.toString(),
+                    quoteAddress: poolData.quoteMint.toString(),
+                    exchange: "Raydium",
+                    timestamp: new Date().toISOString(),
+                  },
+                ]);
+              }
+            }
+          } catch (error) {
+            console.error("Error processing transaction:", error);
+          }
+        }
+      },
+      "confirmed"
+    );
+
+    return () => connectionWs.removeOnLogsListener(logSubId);
+  }, []);
+
+  // ===== New useEffect: Monitor program account changes with filters =====
+  useEffect(() => {
+    const connectionWs = new Connection(config.QUICKNODE_HTTP_ENDPOINT, {
+      wsEndpoint: config.QUICKNODE_WS_ENDPOINT,
+    });
+
+    // Filters: dataSize set to 648 (updated size for Raydium V4 pools)
+    // and a memcmp filter at offset 8 with bytes "D" to help identify initialized pool accounts.
+    const accountSubId = connectionWs.onProgramAccountChange(
+      RAYDIUM_PROGRAM_ID,
+      async (accountInfo) => {
+        try {
+          const poolData = RaydiumPoolLayout.decode(accountInfo.account.data);
+
+          setNewPools((prev) => {
+            const exists = prev.some(
+              (pool) => pool.lpAddress === accountInfo.accountId.toString()
+            );
+
+            if (!exists) {
+              return [
+                ...prev,
+                {
+                  lpSignature: "Live Update",
+                  lpAddress: accountInfo.accountId.toString(),
+                  tokenAddress: poolData.baseMint.toString(),
+                  quoteAddress: poolData.quoteMint.toString(),
+                  exchange: "Raydium",
+                  timestamp: new Date().toISOString(),
+                },
+              ];
+            }
+            return prev;
+          });
+        } catch (error) {
+          console.error("Error decoding pool account:", error);
+        }
+      },
+      "confirmed",
+      [{ dataSize: 648 }, { memcmp: { offset: 8, bytes: "D" } }]
+    );
+
+    return () => {
+      connectionWs.removeProgramAccountChangeListener(accountSubId);
+    };
+  }, []);
+
+  // Toggle profile popover
   const handleProfileClick = (event) => {
     setProfileAnchorEl(profileAnchorEl ? null : event.currentTarget);
   };
   const profileMenuOpen = Boolean(profileAnchorEl);
 
-  // Recommended settings (for demo purposes)
+  // Toggle measurement mode handler
+  const handleMeasurementModeChange = (event, newMode) => {
+    if (newMode !== null) {
+      setMeasurementMode(newMode);
+    }
+  };
+
+  // Recommended settings
   const setRecommendedSettings = () => {
     setAmountToBuy("1");
     setMaxTrades("3");
     setBuyingMarketCap("50");
     setSellingMarketCap("100");
-    setMaxTokenHoldings("5");
     setStopLoss("5");
     setSlippage("0.5");
     setPriorityFee("0.00005");
   };
 
-  // Disable Start Trading until all required fields are filled
+  // Disable Start Trading until required fields are filled
   const requiredFieldsFilled =
     amountToBuy &&
     maxTrades &&
     buyingMarketCap &&
     sellingMarketCap &&
-    maxTokenHoldings &&
     stopLoss &&
     slippage &&
     priorityFee;
 
-  // Start Trading: disable form and start timer, then autoscroll to stats
+  // Start Trading
   const handleStartTrading = () => {
     console.log("Starting trading with settings:", {
       amountToBuy,
       maxTrades,
       buyingMarketCap,
       sellingMarketCap,
-      maxTokenHoldings,
       stopLoss,
       slippage,
       priorityFee,
       socialChecks: { checkTwitter, checkTelegram, checkWebsite },
+      measurementMode,
     });
     setTradingStarted(true);
     statsRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -211,7 +388,7 @@ export default function TradeDashboard() {
     // Insert emergency sell logic here...
   };
 
-  // Shutdown: sell all open positions and disconnect
+  // Shutdown
   const handleShutdown = () => {
     console.log("Shutdown: Selling all open positions and disconnecting.");
     // Insert shutdown logic here...
@@ -283,6 +460,19 @@ export default function TradeDashboard() {
         </Alert>
       </Box>
 
+      {/* Measurement Mode Toggle */}
+      <Box sx={{ mb: 2, textAlign: "center" }}>
+        <ToggleButtonGroup
+          color="primary"
+          value={measurementMode}
+          exclusive
+          onChange={handleMeasurementModeChange}
+        >
+          <ToggleButton value="SOL">Measure by SOL</ToggleButton>
+          <ToggleButton value="%">Measure by %</ToggleButton>
+        </ToggleButtonGroup>
+      </Box>
+
       {/* Trade Form */}
       <Paper sx={{ p: 2, mb: 2 }}>
         <Typography variant="caption" sx={{ color: "error.main" }}>
@@ -292,7 +482,9 @@ export default function TradeDashboard() {
           {/* Row 1: Three fields */}
           <Grid item xs={12} sm={4}>
             <TextField
-              label="Amount (SOL) *"
+              label={
+                measurementMode === "SOL" ? "Amount (SOL) *" : "Amount (%) *"
+              }
               variant="outlined"
               type="number"
               size="small"
@@ -300,6 +492,9 @@ export default function TradeDashboard() {
               disabled={tradingStarted}
               value={amountToBuy}
               onChange={(e) => setAmountToBuy(e.target.value)}
+              helperText={
+                measurementMode === "%" ? "Percentage of wallet balance" : ""
+              }
             />
           </Grid>
           <Grid item xs={12} sm={4}>
@@ -329,7 +524,11 @@ export default function TradeDashboard() {
           {/* Row 2 */}
           <Grid item xs={12} sm={4}>
             <TextField
-              label="Selling Cap (SOL) *"
+              label={
+                measurementMode === "SOL"
+                  ? "Selling Cap (SOL) *"
+                  : "Selling Cap (%) *"
+              }
               variant="outlined"
               type="number"
               size="small"
@@ -337,23 +536,18 @@ export default function TradeDashboard() {
               disabled={tradingStarted}
               value={sellingMarketCap}
               onChange={(e) => setSellingMarketCap(e.target.value)}
+              helperText={
+                measurementMode === "%" ? "Percentage of Buying Cap" : ""
+              }
             />
           </Grid>
           <Grid item xs={12} sm={4}>
             <TextField
-              label="Token Holdings (%) *"
-              variant="outlined"
-              type="number"
-              size="small"
-              fullWidth
-              disabled={tradingStarted}
-              value={maxTokenHoldings}
-              onChange={(e) => setMaxTokenHoldings(e.target.value)}
-            />
-          </Grid>
-          <Grid item xs={12} sm={4}>
-            <TextField
-              label="Stop Loss (%) *"
+              label={
+                measurementMode === "SOL"
+                  ? "Stop Loss (SOL) *"
+                  : "Stop Loss (%) *"
+              }
               variant="outlined"
               type="number"
               size="small"
@@ -361,6 +555,9 @@ export default function TradeDashboard() {
               disabled={tradingStarted}
               value={stopLoss}
               onChange={(e) => setStopLoss(e.target.value)}
+              helperText={
+                measurementMode === "%" ? "Percentage of Buying Cap" : ""
+              }
             />
           </Grid>
           {/* Row 3 */}
@@ -399,7 +596,7 @@ export default function TradeDashboard() {
               Recommended
             </Button>
           </Grid>
-          {/* Toggle switches grouped together */}
+          {/* Toggle switches */}
           <Grid item xs={12}>
             <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
               <FormControlLabel
@@ -452,7 +649,7 @@ export default function TradeDashboard() {
         </Grid>
       </Paper>
 
-      {/* Controls near Tables: Timer, Emergency Sell & Shutdown */}
+      {/* Controls: Timer, Emergency Sell & Shutdown */}
       <Box sx={{ mb: 2 }}>
         <Grid container spacing={2} alignItems="center">
           <Grid item xs={12} md={4}>
@@ -570,7 +767,40 @@ export default function TradeDashboard() {
         </Grid>
       </Box>
 
-      {/* Tables Section with Borders */}
+      {/* New Pools Table */}
+      <Box sx={{ mb: 2 }}>
+        <Typography variant="h6" sx={{ mb: 1 }}>
+          New Raydium Pools
+        </Typography>
+        <Paper sx={{ p: 1 }}>
+          <Table size="small">
+            <TableHead>
+              <TableRow>
+                <TableCell>LP Signature</TableCell>
+                <TableCell>LP Address</TableCell>
+                <TableCell>Token Address</TableCell>
+                <TableCell>Quote Address</TableCell>
+                <TableCell>Exchange</TableCell>
+                <TableCell>Timestamp</TableCell>
+              </TableRow>
+            </TableHead>
+            <TableBody>
+              {newPools.map((pool) => (
+                <TableRow key={pool.lpSignature}>
+                  <TableCell>{pool.lpSignature}</TableCell>
+                  <TableCell>{pool.lpAddress}</TableCell>
+                  <TableCell>{pool.tokenAddress}</TableCell>
+                  <TableCell>{pool.quoteAddress}</TableCell>
+                  <TableCell>{pool.exchange}</TableCell>
+                  <TableCell>{pool.timestamp}</TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </Paper>
+      </Box>
+
+      {/* Existing Tables Section */}
       <Box>
         <Grid container spacing={2}>
           <Grid item xs={12} md={6}>
